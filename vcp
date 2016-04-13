@@ -1,0 +1,517 @@
+#!/bin/bash
+#to extract: sed -e '/^exit$/ q' <scriptfile>
+
+error_fd=2
+error_action="exit 2"
+
+function panic(){
+  errmsg="$1"
+
+    oldIFS="$IFS"
+    IFS='<'
+      from="from ${FUNCNAME[*]}"
+    IFS="$oldIFS"
+
+  if [ -z "$errmsg" ]; then
+    errmsg="$from"
+  fi
+  if [ -n "$DEBUG" ] ; then
+    echo "$errmsg" 1>&2
+    echo "$from" 1>&2
+  fi
+  echo "error $errmsg" 1>&"$error_fd"
+  $error_action
+}
+
+function for_user_only(){
+  fn="$1"
+  ls -lR "$fn" | egrep -q -v "^$fn(/.+)?:$"'|^$|^total [0-9]+$|^....------' >/dev/null && \
+    panic "file $fn should be user readable and writable only"
+}
+
+function client_validate(){
+
+  echo "$vmname" | egrep -q '[:/ .]' && panic "illegal chars in vmname: $vmname"
+  [ `echo "$vmname" | wc -l` == 1 ] || panic "newline in vmname: $vmname"
+
+  [ -e "$vmdir" ] || panic "vm dir $vmname does not exist"
+  [ -e "$vmxfile" ] || panic "vmx file $vmxfile does not exist"
+
+
+#echo 1
+  #1st serial port must be set up as using named-pipe From: Server To: An Application filename: vcp-control.socket
+
+  #check if vm running
+  [ -e "$vmdir"/vcp-transit.vmdk.lck ] || panic "vm must be running"
+
+  egrep -q '^serial0\.present = "TRUE"$'                 "$vmxfile" || panic "control file on serial0 (com1) not set up 1"
+  egrep -q '^serial0\.fileType = "pipe"$'                "$vmxfile" || panic "control file on serial0 (com1) not set up 2"
+  egrep -q '^serial0\.fileName = "vcp-control.socket"$'  "$vmxfile" || panic "control file on serial0 (com1) not set up 3"
+  expected_serial0_lines=3
+  if egrep -q '^serial0\.pipe.endPoint = "server"$'         "$vmxfile" ; then
+    (( expected_serial0_lines+=1 ))
+  fi
+  if egrep -q '^serial0\.tryNoRxLoss = "TRUE"$'          "$vmxfile"; then
+    (( expected_serial0_lines+=1 ))
+  fi
+  [ `egrep -c 'serial0' "$vmxfile"` == "$expected_serial0_lines" ] || panic "control file on serial0 (com1) not set up 5"
+#echo 3
+  #check if vm devices exist in vm config
+  egrep -q '^scsi0:13\.present = "TRUE"$'              "$vmxfile" || panic "bulk transit file on scsi0:13 not set up 1"
+  egrep -q '^scsi0:13\.fileName = "vcp-transit.vmdk"$' "$vmxfile" || panic "bulk transit file on scsi0:13 not set up 2"
+  egrep -q '^scsi0:13\.writeThrough = "TRUE"$'         "$vmxfile" || panic "bulk transit file on scsi0:13 not set up 3"
+  expected_scsi13_lines=3
+  if egrep -q '^scsi0:13\.redo = ""$'                  "$vmxfile" || panic "bulk transit file on scsi0:13 not set up 4"; then
+    expected_scsi13_lines=4
+  fi
+  [ `egrep -c 'scsi0:13' "$vmxfile"` == "$expected_scsi13_lines" ] || panic "bulk transit file on scsi0:13 not set up 5"
+#echo 5
+
+  #check if device files exist
+  [ -e "$data_dev" ] || panic "bulk transit file $data_dev is missing"
+  [ -e "$ctl_dev" ] || panic "control device $ctl_dev is missing"
+#echo 6
+  #check if device files group or world accessible
+  for_user_only "$ctl_dev"
+#echo 7
+  for_user_only "$data_dev"
+#echo 8
+
+  #check entire vm state group or world accessible
+  for_user_only "$vmdir"
+#echo 9
+}
+
+function init_c(){
+  vmname="$1"
+
+  [ -z "$vmname" ] && panic "must specify a vm!"
+
+  vmdir=~/vmware/"$vmname"
+  vmxfile="$vmdir"/"$vmname".vmx
+  ctl_dev="$vmdir"/vcp-control.socket
+  data_dev="$vmdir"/vcp-transit-flat.vmdk
+
+#echo chmod
+  chmod -R go-rwx "$vmdir"
+
+#echo cv
+  client_validate #implicitly uses all 'local' vars
+
+
+  #get lock on com1 before proceeding
+  exec 9>"$ctl_dev".lock
+  flock -w 4 -n 9 || panic "$ctl_dev in $vmname already in use"
+  trap "fini_c" EXIT
+
+
+  #convert unixdomain socket vmware creates to a pipe
+  #more amenable to shell scripting
+#echo nc
+  coproc nc -U "$ctl_dev"
+
+  sleep 0.1
+  [ -n "$COPROC_PID" -a -d /proc/"$COPROC_PID" ] || \
+    panic "connection to ctrl port refused. buffer full? is vcp --server runnning in $vmname?"
+
+  #dup orig coproc IO
+  exec 3>&"${COPROC[1]}" 4<&"${COPROC[0]}"
+  #exec"${COPROC[1]}">&- "${COPROC[0]}"<&- #and close orig handles... maybe not
+
+#echo 'ok client start' >&3
+
+}
+
+function fini_c(){
+  [ -e "$ctl_dev".lock ] && rm "$ctl_dev".lock
+  exec 3>&- 4<&- 9>&- #close em
+  if [ -n "$COPROC_PID" -a -d /proc/"$COPROC_PID" ]; then
+    kill "$COPROC_PID"
+    COPROC_PID=''
+  fi
+}
+
+#message types in the protocol:
+  #>    get filename
+  #>*   put filename length sha256
+  #>*   entropy entropyname length sha256
+
+  #<*   data filename length sha256 (to get only)
+  #<    error err msg...
+  #<    retry err msg...
+  #<    ok nonerr msg...
+
+  #  > = request  < = reply  * = has data attached
+
+
+function read_packet4(){
+  read -s  cmd name length sha <&4 || panic "read request failed: $?"
+  msg="$name $length $sha"
+}
+
+function read_packet4_timeout(){
+  read -s -t 0.3 cmd name length sha <&4 || panic "read response failed: $?"
+  msg="$name $length $sha"
+}
+
+function get(){
+  host="$1"; from="$2"; to="$3"
+
+  echo "get $from" >&3
+
+  read_packet4_timeout
+  [ data == "$cmd" ] || panic "error response to get: $cmd $msg"
+  [ "$from" == "$name" ] || panic "get returned wrong file"
+
+  read_file_from_raw_disk "$to" "$length" "$sha"
+
+}
+
+function put(){
+  host="$1"; to="$2"; from="$3"
+  write_file_to_raw_disk "$from" "put" "$to"
+
+  read_packet4_timeout
+
+  [ ok == "$cmd" ] || panic "error response to put: '$cmd' '$msg'"
+
+}
+
+function install(){
+  #install this script to somewhere
+  path_to_this_script="${BASH_SOURCE[0]}"
+  mkdir ~/bin/ >/dev/null 2>&1
+  cp "$path_to_this_script" ~/bin/ >/dev/null 2>&1
+  chmod u+x ~/bin/vcp
+
+
+  if [ 0 == `id -u` ]; then #root?
+    #drop a startup line into /etc/rc.local if not already there
+    grep -q '#start vcp server$' /etc/rc.local ||
+      perl -wne '
+        m/^exit/ && print "/root/bin/vcp --server &  #start vcp server\n";
+        print;
+      ' -i /etc/rc.local
+
+    false&&if ! grep -q '#start vcp server$' /etc/rc.local ; then #old way
+      exit_line=`grep -n '^exit' /etc/rc.local|cut -d: -f1`
+      if [ -z "$exit_line" ]; then
+        exit_line=`wc -l </etc/rc.local`
+        (( exit_line += 1 ))
+      fi
+      (( last_wo_exit=exit_line-1 ))
+      cp -a /etc/rc.local /etc/rc.local.old
+      {
+        head --lines="$last_wo_exit" /etc/rc.local.old
+        echo "$HOME/bin/vcp --server &  #start vcp server"
+        tail --lines=+"$exit_line" /etc/rc.local.old
+      } > /etc/rc.local
+    fi
+  else #
+    crontab -l|grep -q 'vcp --server &$' || \
+      { crontab -l
+        echo "@reboot $HOME/bin/vcp --server &"
+      }|crontab -
+
+  fi
+
+  #note this install is for servers only!
+  #don't use this on the client!
+}
+
+function init_s(){
+
+  data_dev=/dev/sdb
+  ctl_dev=/dev/ttyS0
+  user=`id -un`
+
+  #comm devices must exist and be owned by this user
+  for d in  "$ctl_dev" "$data_dev"; do
+    [ -e "$d" ] || panic
+    [ "$user" == `ls -l "$d" | tr -s ' ' | cut -d' ' -f3` ] || panic
+  done
+
+  chmod go-rwx "$ctl_dev" "$data_dev"
+
+  #disable echoing, any kind of flow ctrl chars, or nl translation
+  #on input or output. jeez, unix, just let it be a plain channel
+  #for moving characters without changing or adding to them in any
+  #way. also, go very fast. presumably hardware (rts/cts) flow
+  #control is still enabled (does it work in a virtual device?).
+  stty -F "$ctl_dev" \
+    115200 -echo \
+    -ixon -ixoff \
+    -icrnl -inlcr \
+    -ocrnl -onlcr \
+    -hup ignbrk \
+    || panic 'stty failure'
+
+  #check if comm devices group or world accessible
+  for_user_only "$ctl_dev"
+  for_user_only "$data_dev"
+
+  exec 3>"$ctl_dev" 4<"$ctl_dev" || panic
+}
+
+function server(){
+  while true; do
+  #within this loop, panic jumps back to the top of the loop
+  #instead of killing the whole process
+    init_s  #unfortunately, init_s needs to rerun each time
+    #it seems the ctl_dev needs to be reopened every time
+    #for whatever stupid reason
+
+    #override panic to error reply to ctldev
+    error_fd=3
+    error_action=continue
+
+    #top of while loop used to be here... still should be
+    read_packet4
+
+    echo "$cmd" | egrep -q '^(put|get|entropy)$' || panic "bad command $cmd" >&3
+    [ -z "$name" ] && panic
+
+    "s_$cmd" "$name" "$length" "$sha"
+  done
+}
+
+function s_get(){
+  fn="$1"
+
+
+  write_file_to_raw_disk "$fn" "data" "$fn"
+}
+
+function s_put(){
+  fn="$1"; length="$2"; sha256="$3"
+
+  read_file_from_raw_disk "$fn" "$length" "$sha256"
+
+  echo "ok" >&3
+}
+
+function s_entropy(){ #
+  fn="$1"; length="$2"; sha256="$3"
+
+  [ entropy == "$fn" ] || panic
+
+  dd if="$data_dev" bs="$length" count="1" >/dev/urandom 2>/dev/null || panic "dd failed during entropy read: $?"
+
+  echo "ok" >&3
+}
+
+
+function write_file_to_raw_disk(){ #also writes command to control socket notifying readiness
+
+  orig="$1"; cmd="$2"; to="$3"; length="$4"
+
+  [ -e "$orig" ] || panic "no such file: $orig"
+
+  [ -z "$length" ] && length=`wc -c <"$orig"`
+  sha256=`sha256sum "$orig" | cut -d" " -f1`
+
+  echo "$length" | egrep -q '^[0-9]+$' || panic "nonnumeric length $length"
+
+  [ "$length" -gt 10485760 ] && panic "file too long"
+
+  ((
+     bs=4096,
+     div=length/bs,
+     mod=length%bs,
+     mod>0 && (div+=1)
+  ))
+
+
+  #echo dd if="$orig" of="$data_dev" conv=notrunc bs="$bs" count="$div" 1>&2
+  dd if="$orig" of="$data_dev" conv=notrunc bs="$bs" count="$div" 2>/dev/null || panic "dd failed during write: $?"
+
+  echo "$cmd $to $length $sha256" >&3
+
+}
+
+function read_file_from_raw_disk(){
+  dest="$1"; length="$2"; sha256="$3"
+
+  echo "$length" | egrep -q '^[0-9]+$' || panic 'bad length'
+
+  ((
+     bs=4096,
+     div=length/bs,
+     mod=length%bs,
+     mod>0 && (div+=1)
+  ))
+
+  #echo dd of="$dest" if="$data_dev" bs="$bs" count="$div" 1>&2
+  dd of="$dest:new" if="$data_dev" bs="$bs" count="$div" 2>/dev/null || panic "dd failed during read: $?"
+  if [ "$mod" > 0 ] ; then
+    truncate "$dest:new" --size="$length" || panic 'truncate failed'
+  fi
+
+  if [ "$sha256" == `sha256sum  - <"$dest:new"|cut -d" " -f1` ] ; then
+    mv "$dest:new" "$dest"
+  else
+    rm "$dest:new"
+    panic 'sha256 mismatch'
+  fi
+}
+
+function fn_safe_chars(){
+  for fn in "$@"; do
+    echo "$fn" | egrep -q '[: ]' && panic "bad char in $fn"
+  done
+  [ 1 == `echo "$@"|wc -l` ] || panic "newline somewhere in $@"
+}
+
+function clear(){
+  host="$1"
+  init_c "$host"
+  dd if=/dev/zero of="$data_dev" bs=4096 count=2560 2>/dev/null || panic
+}
+
+function broadcast(){
+  input="$1"
+  length=`wc -c <"$input"`
+  ((
+     bs=4096,
+     div=length/bs,
+     mod=length%bs,
+     mod>0 && (div+=1)
+  ))
+
+  for vmdk in ~/vmware/*/vcp-transit-flat.vmdk; do
+    dd if="$input" of="$vmdk" conv=notrunc bs="$bs" count="$div" 2>/dev/null
+  done
+}
+
+function entropy(){ #
+  host="$1"
+
+  init_c "$host"
+
+  write_file_to_raw_disk /dev/urandom "entropy" "entropy" 128
+
+  read_packet4_timeout
+  [ ok == "$cmd" ] || panic "error response to put: '$cmd' '$msg'"
+}
+
+function test(){
+
+
+
+  #clear test
+  clear scratch
+  fini_c
+
+
+  file=~/.bashrc
+
+
+  #put test
+  #override read_packet4_timeout
+  init_c scratch
+  function read_packet4_timeout(){ cmd=ok; }
+      put scratch /tmp/whocares ~/.bashrc
+  length=`wc -c <"$file"`;
+  cmp -n "$length" "$file" "$data_dev" || panic
+  fini_c
+
+  #get test
+  #override read_packet4_timeout
+  init_c scratch
+  function read_packet4_timeout(){
+    cmd=data;
+    name=/tmp/whocares;
+    length=`wc -c <"$file"`;
+    sha=`sha256sum "$file"|cut -d" " -f 1`
+    msg="$name $length $sha";
+  }
+      get scratch /tmp/whocares /tmp/get.output
+  cmp "$file" /tmp/get.output || panic
+  fini_c
+
+  echo ran all tests
+}
+
+function remote_copy(){
+  from="$1"; to="$2"
+#  remote_copy_with_errlines "$from" "$to"
+#}
+
+#function remote_copy_with_errlines(){
+#  from="$1"; to="$2"
+
+#echo rc
+
+  if echo "$from" | fgrep -q ":" ; then #get #
+
+    host=`echo "$from" | cut -d: -f1`
+    from=`echo "$from" | cut -d: -f2`
+
+    init_c "$host"
+    fn_safe_chars "$from" "$to"
+
+    get "$host" "$from" "$to"
+
+  elif echo "$to" | fgrep -q ":"; then #put #
+    host=`echo "$to" | cut -d: -f1`
+    to=`echo "$to" | cut -d: -f2`
+
+#echo ic
+    init_c "$host"
+#echo ic9
+    fn_safe_chars "$from" "$to"
+
+#echo put
+    put "$host" "$to" "$from"
+
+  else
+    panic "bad vcp arguments"
+  fi
+
+  exit
+}
+
+#subcommands:
+#clear    clear transit buffer after moving sensitive data (eg keys)
+#install  install as server
+#cp
+#server
+#broadcast
+#entropy
+
+if [ "$1" == "--clear" ] ; then
+    clear "$2"
+
+elif [ "$1" == "--install" ] ; then
+    install
+
+elif [ "$1" == "--server" ] ; then
+    server
+
+elif [ "$1" == "--broadcast" ] ; then
+    broadcast "$2"
+
+elif [ "$1" == "--entropy" ] ; then
+    entropy
+
+elif [ "$1" == "--test" ] ; then
+    test
+
+else
+    remote_copy "$1" "$2"
+fi 2>&1 | egrep -v '^[^ ]+: line [0-9]+: [0-9]+ Terminated +coproc COPROC nc -U '
+#hacky way to suppress error messages, i know
+
+#todo:
+#inline data
+#encryption w spipe
+#cmdline key mgmt
+#ip networking
+#network key mgmt??
+#run as non-root
+#prevent writing to executables/devices as non-root
+#maybe set pipefail and/or -e
+#v locking during operation to prevent races
+#detect file too large and error out
+
+exit
