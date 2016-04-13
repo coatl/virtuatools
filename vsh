@@ -1,6 +1,6 @@
 #!/bin/bash
 #connect terminal session to serial port of a vmware vm.
-#via unix socket which should be attached to serial port /dev/ttyS1 on the vm
+#via unix socket attached to serial port /dev/ttyS1 on the vm
 #result: a shell to the vm that bypasses vmware user-interface.
 #you must set up the serial port in vmware and arrange for command line on it within the vm.
 #validate checks the vm setup. see config example at eof.
