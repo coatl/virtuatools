@@ -1,0 +1,11 @@
+This is a collection of little scripts I have found useful when working 
+with vmware virtual machines.
+
+vmstart.sh  -  start up a vm from the command line, and prevent its 
+               window from having an ugly name
+copy-vm.sh  -  copy (or rename) an existing vm
+vcp         -  copy a file to or from a running vm. 
+               requires agent running in the vm
+vsh         -  connect to a serial console in a running vm. 
+               requires getty running on serial port in the vm
+vm-hd-mv.sh -  move a virtual hard drive from one vm to another
