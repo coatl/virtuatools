@@ -1,6 +1,15 @@
 #!/bin/bash
 #to extract: sed -e '/^exit$/ q' <scriptfile>
 
+#vm virtual devices needed by this script
+#a serial device on COM1 (aka: serial0 ttyS0)
+  #connected to a unix-domain socket named vcp-control.socket (no dir)
+#a hard drive on scsi0:13 named vcp-transit.vmdk (also no dir)
+  #10MB
+  #configured as one flat file, not 2GB chunks
+  #write-caching disabled
+
+
 error_fd=2
 error_action="exit 2"
 
